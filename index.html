@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="lv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OBD kļūdu lasītājs</title>
+<style>
+:root{
+  --bg:#f2f3f1; --panel:#ffffff; --ink:#16191c; --muted:#5d666d; --line:#d5d9db;
+  --amber:#e69500; --amber-ink:#2b1c00; --ok:#1f7a4d; --bad:#b3261e;
+  --code-bg:#16191c; --code-ink:#d8e0e4;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#101315; --panel:#191d20; --ink:#e8ecee; --muted:#9aa5ab; --line:#2c3338;
+         --amber:#ffb020; --amber-ink:#1d1300; --ok:#4cc38a; --bad:#ff8a80;
+         --code-bg:#0b0d0f; --code-ink:#b9c6cc; }
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);
+  font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:640px;margin:0 auto;padding:16px 16px 48px}
+h1{font-size:1.35rem;margin:8px 0 2px}
+.sub{color:var(--muted);margin:0 0 16px;font-size:.92rem}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+button{font:inherit;font-weight:600;border:1px solid var(--line);background:var(--panel);color:var(--ink);
+  padding:12px 16px;border-radius:8px;min-height:48px;flex:1 1 140px;cursor:pointer}
+button.primary{background:var(--amber);color:var(--amber-ink);border-color:transparent}
+button.danger{color:var(--bad)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
+.status{display:flex;gap:10px;align-items:center;padding:10px 12px;border:1px solid var(--line);
+  background:var(--panel);border-radius:8px;margin-bottom:16px;font-size:.92rem}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--muted);flex:none}
+.dot.on{background:var(--ok)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin-bottom:16px}
+.card h2{font-size:1rem;margin:0;padding:12px 14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between}
+.row{display:flex;gap:12px;padding:10px 14px;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:0}
+.row b{font:600 1.05rem ui-monospace,Menlo,Consolas,monospace;min-width:64px}
+.row span{color:var(--muted)}
+.empty{padding:14px;color:var(--muted)}
+.mil{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.85rem;font-weight:700}
+.mil.on{background:var(--amber);color:var(--amber-ink)}
+.mil.off{border:1px solid var(--line);color:var(--muted)}
+.meta{padding:10px 14px;color:var(--muted);font-size:.9rem;border-bottom:1px solid var(--line)}
+pre{margin:0;padding:12px 14px;background:var(--code-bg);color:var(--code-ink);border-radius:0 0 8px 8px;
+  font:.8rem/1.4 ui-monospace,Menlo,Consolas,monospace;max-height:220px;overflow:auto;white-space:pre-wrap}
+.err{color:var(--bad);padding:10px 12px;border:1px solid var(--bad);border-radius:8px;margin-bottom:16px;display:none}
+a{color:inherit}
+@media (prefers-reduced-motion:no-preference){ .dot{transition:background .2s} }
+</style>
+</head>
+<body>
+<main>
+  <h1>OBD kļūdu lasītājs</h1>
+  <p class="sub">Darbojas tikai telefonā, bez servera. Dzinēja un izplūdes kodi (OBD2).</p>
+
+  <div class="status"><span class="dot" id="dotBle"></span><span id="txtBle">Adapteris nav pieslēgts</span></div>
+  <div class="err" id="err"></div>
+
+  <div class="bar">
+    <button id="btnConnect" class="primary">Pieslēgt adapteri</button>
+    <button id="btnScan" disabled>Nolasīt kodus</button>
+    <button id="btnClear" class="danger" disabled>Dzēst kodus</button>
+  </div>
+
+  <div class="card" id="resCard" hidden>
+    <h2>Rezultāts <span id="mil"></span></h2>
+    <div class="meta" id="meta"></div>
+    <div id="stored"></div>
+    <h2 style="border-top:1px solid var(--line)">Gaidošie kodi</h2>
+    <div id="pending"></div>
+  </div>
+
+  <div class="card">
+    <h2>Iepriekšējie nolasījumi</h2>
+    <div id="hist"><div class="empty">Vēl nav.</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Sarakste ar adapteri</h2>
+    <pre id="log"></pre>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const SERVICES = [
+  "0000fff0-0000-1000-8000-00805f9b34fb",
+  "0000ffe0-0000-1000-8000-00805f9b34fb",
+  "000018f0-0000-1000-8000-00805f9b34fb",
+  "e7810a71-73ae-499d-8c15-faa9aef0c3f2",
+  "bef8d6c9-9c21-4c9e-b632-bd58c1009f9f",
+  "0000fff0-0000-1000-8000-00805f9b34fb"
+];
+
+let device, txChar, rxChar, rxBuf = "", rxResolve = null, lastScan = null, busy = false;
+const enc = new TextEncoder(), dec = new TextDecoder();
+const HKEY = "obd_history_v1";
+
+const DESC = {
+ P0011:"Sadales vārpstas (A) fāzu regulēšana pārāk agra (1. bloks)",
+ P0016:"Kloķvārpstas un sadales vārpstas pozīciju neatbilstība (1. bloks, sensors A)",
+ P0087:"Degvielas sliedes spiediens pārāk zems", P0101:"MAF sensora signāls ārpus diapazona",
+ P0113:"Ieplūdes gaisa temperatūras sensors: augsts signāls", P0171:"Maisījums pārāk liess (1. bloks)",
+ P0172:"Maisījums pārāk bagāts (1. bloks)", P0299:"Turbo spiediens pārāk zems",
+ P0300:"Nejauši / vairāki aizdedzes izlaidumi", P0301:"1. cilindra aizdedzes izlaidumi",
+ P0302:"2. cilindra aizdedzes izlaidumi", P0303:"3. cilindra aizdedzes izlaidumi",
+ P0304:"4. cilindra aizdedzes izlaidumi", P0325:"Detonācijas sensora ķēdes kļūda (1. bloks)",
+ P0335:"Kloķvārpstas pozīcijas sensora A ķēdes kļūda", P0340:"Sadales vārpstas pozīcijas sensora A ķēdes kļūda",
+ P0401:"EGR plūsma nepietiekama", P0402:"EGR plūsma pārāk liela", P0403:"EGR vadības ķēdes kļūda",
+ P0420:"Katalizatora efektivitāte zem sliekšņa (1. bloks)", P0562:"Sistēmas spriegums zems",
+ P0563:"Sistēmas spriegums augsts", P0606:"Vadības bloka procesora kļūda"
+};
+
+function cleanLines(text){
+  const out=[];
+  for(let line of text.split(/[\r\n]+/)){
+    line=line.trim().toUpperCase();
+    if(!line||/^(SEARCHING|BUS INIT|STOPPED)/.test(line)||line==="OK"||line==="?"||line===">") continue;
+    if(/^[0-9A-F]{3}$/.test(line)) continue;
+    line=line.replace(/^[0-9A-F]:\s*/,"").replace(/>/g,"");
+    const t=line.split(/\s+/).filter(Boolean);
+    if(t.length&&t.every(x=>/^[0-9A-F]{2}$/.test(x))) out.push(t.map(x=>parseInt(x,16)));
+  }
+  return out;
+}
+function decodeDtcs(b){
+  const codes=[];
+  for(let i=0;i+1<b.length;i+=2){
+    const a=b[i], c=b[i+1];
+    if(a===0&&c===0) continue;
+    const code="PCBU"[a>>6]+((a>>4)&3)+(a&15).toString(16).toUpperCase()+(c>>4).toString(16).toUpperCase()+(c&15).toString(16).toUpperCase();
+    if(!codes.includes(code)) codes.push(code);
+  }
+  return codes;
+}
+function parseDtc(text, modeResp, isCan){
+  let data=[];
+  for(const bs of cleanLines(text)){
+    const idx=bs.indexOf(modeResp);
+    data=data.concat(idx>=0?bs.slice(idx+1):bs);
+  }
+  if(isCan&&data.length) data=data.slice(1);
+  return decodeDtcs(data);
+}
+const mk = list => list.map(c=>({code:c, desc:DESC[c]||""}));
+
+async function elm(cmd, timeout){
+  log("> "+cmd);
+  const r = await bleExchange(cmd, timeout||4000);
+  log("< "+(r.replace(/[\r>]+/g," ").trim()||"(tukšs)"));
+  return r;
+}
+async function scan(){
+  await elm("ATZ",8000);
+  for(const c of ["ATE0","ATL0","ATS1","ATH0","ATAT1","ATSP0"]) await elm(c);
+  const r0 = await elm("0100",15000);
+  if(!cleanLines(r0).length) throw new Error("Auto neatbild. Pārbaudi, vai aizdedze ir ieslēgta.");
+  const proto=(await elm("ATDPN")).replace(/[\r>]/g,"").trim();
+  const volt=(await elm("ATRV")).replace(/[\r>]/g,"").trim();
+  const pn=proto.replace(/^A/,"")[0]||"";
+  const isCan="6789ABC".includes(pn)&&pn!=="";
+  const stored=parseDtc(await elm("03",10000),0x43,isCan);
+  const pending=parseDtc(await elm("07",10000),0x47,isCan);
+  let mil=null;
+  for(const bs of cleanLines(await elm("0101"))){ const i=bs.indexOf(0x41); if(i>=0&&i+2<bs.length) mil=!!(bs[i+2]&0x80); }
+  const res={type:"result",ts:Math.floor(Date.now()/1000),voltage:volt,protocol:proto,mil,stored:mk(stored),pending:mk(pending)};
+  lastScan=res; saveHist({...res,event:"scan"}); renderResult(res); loadHist();
+}
+async function clearCodes(){
+  if(!lastScan) throw new Error("Vispirms nolasi kodus.");
+  const r=await elm("04",8000);
+  const ok=cleanLines(r).some(bs=>bs.includes(0x44));
+  saveHist({event:"clear",ts:Math.floor(Date.now()/1000),ok,before:lastScan});
+  lastScan=null; $("resCard").hidden=true;
+  if(!ok) showErr("Auto neapstiprināja dzēšanu."); else log("Kodi nodzēsti.");
+  loadHist();
+}
+function getHist(){ try{ return JSON.parse(localStorage.getItem(HKEY)||"[]"); }catch(e){ return []; } }
+function saveHist(row){ try{ const h=getHist(); h.push(row); localStorage.setItem(HKEY, JSON.stringify(h.slice(-50))); }catch(e){} }
+async function run(fn){
+  if(busy) return; busy=true; showErr(""); refresh();
+  try{ await fn(); }catch(e){ showErr(e.message); }
+  busy=false; refresh();
+}
+
+async function connectBle(){
+  showErr("");
+  if(!navigator.bluetooth){ showErr("Šis pārlūks neatbalsta Web Bluetooth. Lieto Chrome Android un HTTPS adresi."); return; }
+  try{
+    device = await navigator.bluetooth.requestDevice({acceptAllDevices:true, optionalServices:SERVICES});
+    device.addEventListener("gattserverdisconnected",()=>{ txChar=rxChar=null; setBle(false,"Adapteris atvienots"); });
+    const server = await device.gatt.connect();
+    for(const s of await server.getPrimaryServices()){
+      for(const c of await s.getCharacteristics()){
+        if(!rxChar && (c.properties.notify||c.properties.indicate)) rxChar=c;
+        if(!txChar && (c.properties.write||c.properties.writeWithoutResponse)) txChar=c;
+      }
+      if(rxChar && txChar) break;
+    }
+    if(!rxChar||!txChar) throw new Error("Neatradu rakstīšanas/paziņojumu raksturlielumus. Nosūti man adaptera modeli.");
+    await rxChar.startNotifications();
+    rxChar.addEventListener("characteristicvaluechanged", e=>{
+      rxBuf += dec.decode(e.target.value);
+      if(rxBuf.includes(">") && rxResolve){ const r=rxBuf; rxBuf=""; const f=rxResolve; rxResolve=null; f(r); }
+    });
+    setBle(true,"Adapteris: "+(device.name||"BLE ierīce"));
+  }catch(e){ if(e.name!=="NotFoundError") showErr("Neizdevās pieslēgties: "+e.message); }
+}
+async function bleExchange(cmd, timeout){
+  rxBuf="";
+  const p = new Promise((res,rej)=>{ rxResolve=res; setTimeout(()=>{ if(rxResolve){ rxResolve=null; const r=rxBuf; rxBuf=""; r?res(r):rej(new Error("Adapteris neatbild (taimauts).")); } }, timeout); });
+  const data = enc.encode(cmd+"\r");
+  for(let i=0;i<data.length;i+=20){
+    const chunk=data.slice(i,i+20);
+    if(txChar.properties.writeWithoutResponse) await txChar.writeValueWithoutResponse(chunk);
+    else await txChar.writeValue(chunk);
+  }
+  return p;
+}
+
+function codeRows(list){
+  if(!list.length) return '<div class="empty">Nav.</div>';
+  return list.map(x=>`<div class="row"><b>${x.code}</b><span>${x.desc||"Apraksts nav pieejams. Meklē kodu tīmeklī."}</span></div>`).join("");
+}
+function renderResult(m){
+  $("resCard").hidden=false;
+  $("mil").innerHTML = m.mil===null?"":`<span class="mil ${m.mil?"on":"off"}">Check Engine: ${m.mil?"deg":"nedeg"}</span>`;
+  $("meta").textContent = `Spriegums ${m.voltage} · protokols ${m.protocol}`;
+  $("stored").innerHTML = codeRows(m.stored);
+  $("pending").innerHTML = codeRows(m.pending);
+}
+function loadHist(){
+  const rows = getHist().slice().reverse();
+  if(!rows.length) return;
+  $("hist").innerHTML = rows.map(r=>{
+    const d = new Date(r.ts*1000).toLocaleString("lv-LV");
+    if(r.event==="clear"){ const n=(r.before?.stored||[]).map(x=>x.code).join(", ")||"nebija"; return `<div class="row"><b>Dzēsts</b><span>${d}. Pirms dzēšanas: ${n}</span></div>`; }
+    const n=(r.stored||[]).map(x=>x.code).join(", ")||"kļūdu nav"; return `<div class="row"><b>Nolasīts</b><span>${d}. ${n}</span></div>`;
+  }).join("");
+}
+$("btnConnect").onclick = connectBle;
+$("btnScan").onclick = ()=>run(scan);
+$("btnClear").onclick = ()=>{
+  if(!confirm("Dzēst kļūdu kodus? Pēc tam gatavības monitori tiks atiestatīti. Kodi tiks saglabāti vēsturē.")) return;
+  run(clearCodes);
+};
+loadHist(); refresh();
+</script>
+</body>
+</html>
